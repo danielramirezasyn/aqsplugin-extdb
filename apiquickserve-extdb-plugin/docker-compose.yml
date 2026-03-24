@@ -1,0 +1,65 @@
+# ============================================================
+# docker-compose.yml — Integración ApiQuickServe + ExtDB Plugin
+#
+# Agregar el bloque "extdb-plugin" al compose existente
+# de ApiQuickServe. La red "aqsnet" debe existir o definirse
+# aquí si aún no está declarada.
+# ============================================================
+
+services:
+
+  # ----------------------------------------------------------
+  # Servicio existente de ApiQuickServe (referencia)
+  # Solo se muestra para ilustrar la red compartida.
+  # Tu bloque real ya existe en tu compose.
+  # ----------------------------------------------------------
+  # ords:
+  #   image: container-registry.oracle.com/database/ords:latest
+  #   networks:
+  #     - aqsnet
+  #   ...
+
+  # ----------------------------------------------------------
+  # Plugin: External DB Connector
+  # ----------------------------------------------------------
+  extdb-plugin:
+    image: apiquickserve/extdb:1.0.0
+    container_name: extdb-plugin
+    restart: unless-stopped
+
+    ports:
+      # Puerto 9000 en el host → 8000 dentro del contenedor
+      # Solo necesario para pruebas directas o monitoreo externo.
+      # ApiQuickServe usa el nombre de servicio interno, no este puerto.
+      - "9000:8000"
+
+    networks:
+      - aqsnet
+
+    # El plugin no requiere variables de entorno.
+    # Las credenciales llegan en cada request — no se configuran aquí.
+    # environment: []
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout:  5s
+      retries:  3
+      start_period: 15s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ----------------------------------------------------------
+# Red interna compartida
+# Si ya está declarada en tu compose principal,
+# referenciarla como external: true
+# ----------------------------------------------------------
+networks:
+  aqsnet:
+    driver: bridge
+    # Si la red ya existe y fue creada externamente:
+    # external: true
