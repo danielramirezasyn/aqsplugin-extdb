@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app.core.logging_config import setup_logging
+from app.core.security import API_KEY, verify_api_key
 from app.drivers import get_driver, available_drivers
 from app.models.schemas import ExecuteRequest, ExecuteResponse, HealthResponse
 
@@ -15,6 +16,21 @@ from app.models.schemas import ExecuteRequest, ExecuteResponse, HealthResponse
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+# Muestra la API Key en el log al iniciar para que sea visible en `docker logs`
+logger.info(
+    "\n"
+    "╔══════════════════════════════════════════════════════════════╗\n"
+    "║            ApiQuickServe — External DB Plugin                ║\n"
+    "╠══════════════════════════════════════════════════════════════╣\n"
+    "║  X-API-Key cargada correctamente.                            ║\n"
+    "║                                                              ║\n"
+    "║  PLUGIN_API_KEY → %s\n"
+    "║                                                              ║\n"
+    "║  Incluye este header en cada request a /execute              ║\n"
+    "╚══════════════════════════════════════════════════════════════╝",
+    API_KEY,
+)
 
 app = FastAPI(
     title="ApiQuickServe — External DB Plugin",
@@ -77,6 +93,7 @@ async def health() -> HealthResponse:
     response_model=ExecuteResponse,
     summary="Ejecutar operación en base de datos externa",
     tags=["Ejecución"],
+    dependencies=[Depends(verify_api_key)],
 )
 async def execute(payload: ExecuteRequest) -> ExecuteResponse:
     """

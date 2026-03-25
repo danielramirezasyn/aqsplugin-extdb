@@ -36,9 +36,10 @@ services:
     networks:
       - aqsnet
 
-    # El plugin no requiere variables de entorno.
-    # Las credenciales llegan en cada request — no se configuran aquí.
-    # environment: []
+    environment:
+      # API Key obligatoria. Sin esta variable el contenedor no arranca.
+      # Cámbiala por una clave segura antes de desplegar en producción.
+      PLUGIN_API_KEY: "cambia_esto_por_tu_clave_secreta"
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
