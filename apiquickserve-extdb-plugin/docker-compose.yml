@@ -2,28 +2,17 @@
 # docker-compose.yml — Integración ApiQuickServe + ExtDB Plugin
 #
 # Agregar el bloque "extdb-plugin" al compose existente
-# de ApiQuickServe. La red "aqsnet" debe existir o definirse
-# aquí si aún no está declarada.
+# de ApiQuickServe. La red "oracle-ha-net" debe existir
+# como red externa (external: true).
 # ============================================================
 
 services:
 
   # ----------------------------------------------------------
-  # Servicio existente de ApiQuickServe (referencia)
-  # Solo se muestra para ilustrar la red compartida.
-  # Tu bloque real ya existe en tu compose.
-  # ----------------------------------------------------------
-  # ords:
-  #   image: container-registry.oracle.com/database/ords:latest
-  #   networks:
-  #     - aqsnet
-  #   ...
-
-  # ----------------------------------------------------------
   # Plugin: External DB Connector
   # ----------------------------------------------------------
   extdb-plugin:
-    image: apiquickserve/extdb:1.2.0
+    image: apiquickserve/extdb:1.4.0
     container_name: extdb-plugin
     restart: unless-stopped
 
@@ -36,9 +25,16 @@ services:
     networks:
       - oracle-ha-net
 
+    volumes:
+      # Volumen para persistir las conexiones registradas vía POST /setup.
+      # El archivo connections.json se guarda en /data dentro del contenedor.
+      # Sobrevive a reinicios y rebuilds del contenedor.
+      - extdb-data:/data
+
     environment:
       # -------------------------------------------------------
       # OBLIGATORIO: API Key de autenticación.
+      # Requerida en TODOS los endpoints (incluyendo /health y /setup).
       # Sin esta variable el contenedor no arranca.
       # Cámbiala por una clave segura antes de desplegar.
       # -------------------------------------------------------
@@ -48,30 +44,44 @@ services:
       # Connection Pool — todas las variables son opcionales.
       # Los valores mostrados son los defaults.
       # -------------------------------------------------------
-
-      # Activa o desactiva el pool globalmente.
-      # Valores: "true" | "false"
-      POOL_ENABLED: "true"
-
-      # Conexiones que se crean al arrancar el pool (pre-calentamiento).
-      # Cada combinación única (driver+host+db+usuario) tiene su propio pool.
+      POOL_ENABLED:  "true"
       POOL_MIN_SIZE: "2"
-
-      # Máximo de conexiones simultáneas por pool.
-      # Aumentar si ves timeouts bajo carga alta.
       POOL_MAX_SIZE: "10"
+      POOL_TIMEOUT:  "30"
+      POOL_RECYCLE:  "1800"
 
-      # Segundos que un request espera por una conexión libre antes de fallar
-      # con error TIMEOUT. Aumentar si tus queries son lentos.
-      POOL_TIMEOUT: "30"
+      # -------------------------------------------------------
+      # IP Allowlist — OPCIONAL.
+      # Si no se define (o se deja vacío), acepta cualquier IP.
+      # Si se define, SOLO esas IPs pueden acceder al plugin.
+      # IPs no autorizadas reciben HTTP 403 sin cuerpo.
+      #
+      # Formato: IPs o rangos CIDR separados por coma.
+      # Ejemplos:
+      #   "192.168.1.10"
+      #   "192.168.1.10,10.0.0.5"
+      #   "10.0.0.0/8"
+      #   "192.168.1.10,10.0.0.0/8,172.16.0.0/12"
+      # -------------------------------------------------------
+      # ALLOWED_IPS: ""
 
-      # Segundos de vida máxima de una conexión antes de ser reemplazada.
-      # Evita usar conexiones "zombi" que el servidor ya cerró silenciosamente.
-      # 1800 = 30 minutos.
-      POOL_RECYCLE: "1800"
+      # -------------------------------------------------------
+      # Encriptación de contraseñas — OPCIONAL pero RECOMENDADO.
+      # Si se define, las contraseñas se encriptan con AES-256-GCM
+      # antes de guardarse en /data/connections.json.
+      # Si no se define, las contraseñas se guardan en texto plano.
+      #
+      # Puede ser cualquier frase o string seguro.
+      # Genera una clave fuerte con:
+      #   openssl rand -hex 32
+      #
+      # IMPORTANTE: si cambias esta clave después de registrar
+      # conexiones, deberás volver a registrarlas con POST /setup.
+      # -------------------------------------------------------
+      ENCRYPTION_KEY: "cambia_esto_por_una_frase_secreta_larga"
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "curl -f -H \"X-API-Key: $$PLUGIN_API_KEY\" http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout:  5s
       retries:  3
@@ -84,13 +94,16 @@ services:
         max-file: "3"
 
 # ----------------------------------------------------------
-# Red interna compartida.
-# Si ya está declarada en tu compose principal,
-# referenciarla como external: true
+# Volumen para persistir las conexiones registradas
 # ----------------------------------------------------------
+volumes:
+  extdb-data:
 
+# ----------------------------------------------------------
+# Red interna compartida — debe existir externamente.
+# Crearla si no existe con:
+#   docker network create oracle-ha-net
+# ----------------------------------------------------------
 networks:
   oracle-ha-net:
     external: true
-    # Si la red ya existe y fue creada externamente:
-    # external: true

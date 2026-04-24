@@ -2,13 +2,23 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse, Response
 
 from app.core.logging_config import setup_logging
 from app.core.security import API_KEY, verify_api_key
-from app.drivers import get_driver, available_drivers
-from app.models.schemas import ExecuteRequest, ExecuteResponse, HealthResponse
+from app.core.ip_filter import load_allowed_ips, is_ip_allowed, resolve_client_ip
+from app.core.crypto import is_active as crypto_active
+from app.core.connection_store import (
+    save_connection, get_connection, list_connections, delete_connection,
+)
+from app.drivers import get_driver
+from app.models.schemas import (
+    ConnectionParams, DriverType,
+    ExecuteRequest, ExecuteResponse,
+    SetupRequest, SetupResponse, SetupListResponse, ConnectionInfo,
+    HealthResponse,
+)
 
 # ------------------------------------------------------------------ #
 #  Arranque                                                             #
@@ -17,7 +27,8 @@ from app.models.schemas import ExecuteRequest, ExecuteResponse, HealthResponse
 setup_logging()
 logger = logging.getLogger(__name__)
 
-# Muestra la API Key en el log al iniciar para que sea visible en `docker logs`
+_ALLOWED_IPS = load_allowed_ips()
+
 logger.info(
     "\n"
     "╔══════════════════════════════════════════════════════════════╗\n"
@@ -25,28 +36,44 @@ logger.info(
     "╠══════════════════════════════════════════════════════════════╣\n"
     "║  X-API-Key cargada correctamente.                            ║\n"
     "║                                                              ║\n"
-    "║  PLUGIN_API_KEY → %s\n"
+    "║  PLUGIN_API_KEY  → ***%s\n"
+    "║  Encriptación    → %s\n"
+    "║  IP allowlist    → %s\n"
     "║                                                              ║\n"
-    "║  Incluye este header en cada request a /execute              ║\n"
     "╚══════════════════════════════════════════════════════════════╝",
-    API_KEY,
+    API_KEY[-4:],
+    "AES-256-GCM activa" if crypto_active() else "DESACTIVADA (contraseñas en texto plano)",
+    f"{len(_ALLOWED_IPS)} entrada(s)" if _ALLOWED_IPS else "desactivada",
 )
 
 app = FastAPI(
     title="ApiQuickServe — External DB Plugin",
-    description=(
-        "Plugin para conectividad con bases de datos externas desde ApiQuickServe. "
-        "Recibe credenciales y operación en cada request. Soporta connection pooling configurable."
-    ),
-    version="1.2.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
+    version="1.4.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
 # ------------------------------------------------------------------ #
-#  Manejador global de excepciones no controladas                       #
+#  Middleware: IP allowlist                                             #
+# ------------------------------------------------------------------ #
+
+@app.middleware("http")
+async def ip_allowlist_middleware(request: Request, call_next):
+    if _ALLOWED_IPS is not None:
+        client_ip = resolve_client_ip(
+            headers=dict(request.headers),
+            direct_ip=request.client.host if request.client else "unknown",
+        )
+        if not is_ip_allowed(client_ip, _ALLOWED_IPS):
+            logger.warning("Acceso denegado | ip=%s | path=%s", client_ip, request.url.path)
+            return Response(status_code=403)
+    return await call_next(request)
+
+
+# ------------------------------------------------------------------ #
+#  Manejador global de excepciones                                      #
 # ------------------------------------------------------------------ #
 
 @app.exception_handler(Exception)
@@ -55,19 +82,19 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     return JSONResponse(
         status_code=500,
         content={
-            "status": "error",
-            "error_code": "INTERNAL_ERROR",
+            "status":        "error",
+            "error_code":    "INTERNAL_ERROR",
             "error_message": "Error interno del plugin. Revisar logs del contenedor.",
             "rows_affected": None,
-            "columns": [],
-            "data": [],
-            "execution_ms": 0,
+            "columns":       [],
+            "data":          [],
+            "execution_ms":  0,
         },
     )
 
 
 # ------------------------------------------------------------------ #
-#  Endpoints                                                            #
+#  /health                                                              #
 # ------------------------------------------------------------------ #
 
 @app.get(
@@ -75,18 +102,68 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     response_model=HealthResponse,
     summary="Estado del plugin",
     tags=["Sistema"],
+    dependencies=[Depends(verify_api_key)],
 )
 async def health() -> HealthResponse:
-    """
-    Verifica que el plugin esté operativo.
-    Retorna la versión y los drivers disponibles en esta imagen.
-    """
-    return HealthResponse(
-        status="ok",
-        version="1.2.0",
-        drivers=available_drivers(),
+    return HealthResponse(status="ok", version="1.4.0", drivers=[])
+
+
+# ------------------------------------------------------------------ #
+#  /setup — Gestión de conexiones                                       #
+# ------------------------------------------------------------------ #
+
+@app.post(
+    "/setup",
+    response_model=SetupResponse,
+    summary="Registrar o actualizar una conexión",
+    tags=["Configuración"],
+    dependencies=[Depends(verify_api_key)],
+)
+async def setup_create(payload: SetupRequest) -> SetupResponse:
+    save_connection(
+        alias=payload.alias,
+        driver=payload.driver.value,
+        host=payload.host,
+        port=payload.port,
+        database=payload.database,
+        username=payload.username,
+        password=payload.password,
+    )
+    logger.info("setup | alias='%s' registrado | driver=%s", payload.alias, payload.driver.value)
+    return SetupResponse(status="ok", alias=payload.alias, message="Conexión registrada")
+
+
+@app.get(
+    "/setup",
+    response_model=SetupListResponse,
+    summary="Listar conexiones registradas",
+    tags=["Configuración"],
+    dependencies=[Depends(verify_api_key)],
+)
+async def setup_list() -> SetupListResponse:
+    return SetupListResponse(
+        connections=[ConnectionInfo(**c) for c in list_connections()]
     )
 
+
+@app.delete(
+    "/setup/{alias}",
+    response_model=SetupResponse,
+    summary="Eliminar una conexión registrada",
+    tags=["Configuración"],
+    dependencies=[Depends(verify_api_key)],
+)
+async def setup_delete(alias: str) -> SetupResponse:
+    if not delete_connection(alias):
+        logger.warning("setup DELETE | alias='%s' no encontrado", alias)
+        return SetupResponse(status="error", alias=alias, message="Alias no encontrado")
+    logger.info("setup DELETE | alias='%s' eliminado", alias)
+    return SetupResponse(status="ok", alias=alias, message="Conexión eliminada")
+
+
+# ------------------------------------------------------------------ #
+#  /execute                                                             #
+# ------------------------------------------------------------------ #
 
 @app.post(
     "/execute",
@@ -96,37 +173,53 @@ async def health() -> HealthResponse:
     dependencies=[Depends(verify_api_key)],
 )
 async def execute(payload: ExecuteRequest) -> ExecuteResponse:
-    """
-    Endpoint principal del plugin.
+    # Resolver alias → credenciales (contraseña desencriptada en memoria)
+    try:
+        conn_data = get_connection(payload.connection_alias)
+    except KeyError:
+        logger.warning("execute | alias='%s' no encontrado", payload.connection_alias)
+        return ExecuteResponse(
+            status="error",
+            execution_ms=0,
+            error_code="ALIAS_NOT_FOUND",
+            error_message=(
+                f"El alias '{payload.connection_alias}' no está registrado. "
+                "Usa POST /setup para registrarlo primero."
+            ),
+        )
+    except ValueError as e:
+        # ENCRYPTION_KEY incorrecta o no configurada para un valor ENC:
+        logger.error("execute | error de desencriptación para alias='%s': %s", payload.connection_alias, e)
+        return ExecuteResponse(
+            status="error",
+            execution_ms=0,
+            error_code="DECRYPTION_ERROR",
+            error_message=str(e),
+        )
 
-    Recibe las credenciales de conexión y la operación a ejecutar.
-    Abre una conexión, ejecuta, cierra, y retorna el resultado como JSON normalizado.
-
-    **Importante:**
-    - Las credenciales viajan en el body y nunca se persisten ni se loguean.
-    - El campo `status` siempre es `"ok"` o `"error"`.
-    - En caso de error el HTTP status es 200 — el error viene en el body.
-      Esto simplifica el manejo en PL/SQL del lado de ApiQuickServe.
-
-    **Modos:**
-    - `sql` — query o DML con parámetros posicionales `?`
-    - `block` — bloque de código sin parámetros (DDL, T-SQL batch)
-    - `callable` — nombre de stored procedure + parámetros
-    """
     logger.info(
-        "execute | driver=%s | mode=%s | db=%s@%s:%d",
-        payload.driver.value,
+        "execute | alias=%s | driver=%s | mode=%s | db=%s@%s:%d",
+        payload.connection_alias,
+        conn_data["driver"],
         payload.mode.value,
-        payload.connection.database,
-        payload.connection.host,
-        payload.connection.port,
-        # username y password intencionalmente omitidos del log
+        conn_data["database"],
+        conn_data["host"],
+        conn_data["port"],
+    )
+
+    connection = ConnectionParams(
+        host=conn_data["host"],
+        port=conn_data["port"],
+        database=conn_data["database"],
+        username=conn_data["username"],
+        password=conn_data["password"],   # texto plano solo aquí, en RAM
     )
 
     try:
-        driver = get_driver(payload.driver, payload.connection)
-    except ValueError as e:
-        logger.warning("Driver no disponible: %s", str(e))
+        driver_type = DriverType(conn_data["driver"])
+        driver = get_driver(driver_type, connection)
+    except (ValueError, KeyError) as e:
+        logger.warning("execute | driver no disponible: %s", e)
         return ExecuteResponse(
             status="error",
             execution_ms=0,
@@ -141,8 +234,8 @@ async def execute(payload: ExecuteRequest) -> ExecuteResponse:
     )
 
     logger.info(
-        "execute | driver=%s | status=%s | rows=%s | ms=%d",
-        payload.driver.value,
+        "execute | alias=%s | status=%s | rows=%s | ms=%d",
+        payload.connection_alias,
         result.status,
         result.rows_affected,
         result.execution_ms,

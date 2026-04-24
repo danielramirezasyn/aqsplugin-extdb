@@ -4,7 +4,7 @@
 
 set -e
 
-VERSION=${1:-1.2.0}
+VERSION=${1:-1.4.0}
 IMAGE="apiquickserve/extdb"
 
 echo ">>> Building $IMAGE:$VERSION"

@@ -10,7 +10,7 @@ FROM python:3.12-slim
 
 # --- Metadatos de la imagen ---
 LABEL maintainer="ApiQuickServe <team@apiquickserve.io>"
-LABEL version="1.2.0"
+LABEL version="1.4.0"
 LABEL description="Plugin para conectividad con bases de datos externas desde ApiQuickServe"
 
 # --- Variables de entorno base ---
