@@ -34,7 +34,7 @@ services:
       - "9000:8000"
 
     networks:
-      - aqsnet
+      - oracle-ha-net
 
     environment:
       # -------------------------------------------------------
@@ -88,8 +88,9 @@ services:
 # Si ya está declarada en tu compose principal,
 # referenciarla como external: true
 # ----------------------------------------------------------
+
 networks:
-  aqsnet:
-    driver: bridge
+  oracle-ha-net:
+    external: true
     # Si la red ya existe y fue creada externamente:
     # external: true
