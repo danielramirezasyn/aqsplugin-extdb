@@ -35,10 +35,10 @@ logger.info(
 app = FastAPI(
     title="ApiQuickServe — External DB Plugin",
     description=(
-        "Plugin stateless para conectividad con bases de datos externas desde ApiQuickServe. "
-        "Recibe credenciales y operación en cada request. No almacena configuraciones."
+        "Plugin para conectividad con bases de datos externas desde ApiQuickServe. "
+        "Recibe credenciales y operación en cada request. Soporta connection pooling configurable."
     ),
-    version="1.0.0",
+    version="1.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
@@ -83,7 +83,7 @@ async def health() -> HealthResponse:
     """
     return HealthResponse(
         status="ok",
-        version="1.0.0",
+        version="1.2.0",
         drivers=available_drivers(),
     )
 

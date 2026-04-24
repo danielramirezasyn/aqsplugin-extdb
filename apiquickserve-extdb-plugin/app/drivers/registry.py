@@ -4,22 +4,13 @@ from app.models.schemas import DriverType, ConnectionParams
 from app.drivers.base import BaseDriver
 from app.drivers.sqlserver import SqlServerDriver
 from app.drivers.mysql import MySqlDriver
+from app.drivers.postgres import PostgreSqlDriver
 
-
-# ------------------------------------------------------------------ #
-#  Registry de drivers disponibles                                      #
-#                                                                       #
-#  Para agregar un nuevo motor:                                         #
-#    1. Crear app/drivers/postgresql.py con class PostgreSqlDriver      #
-#    2. Importarlo aquí                                                  #
-#    3. Agregarlo al diccionario DRIVER_REGISTRY                        #
-#    4. Agregar el valor al enum DriverType en schemas.py               #
-# ------------------------------------------------------------------ #
 
 DRIVER_REGISTRY: dict[DriverType, type[BaseDriver]] = {
-    DriverType.sqlserver: SqlServerDriver,
-    DriverType.mysql:     MySqlDriver,
-    # DriverType.postgresql: PostgreSqlDriver,   # v1.1
+    DriverType.sqlserver:  SqlServerDriver,
+    DriverType.mysql:      MySqlDriver,
+    DriverType.postgresql: PostgreSqlDriver,
 }
 
 

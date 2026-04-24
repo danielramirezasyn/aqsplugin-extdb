@@ -11,13 +11,13 @@ from pydantic import BaseModel, Field
 
 class DriverType(str, Enum):
     sqlserver  = "sqlserver"
-    postgresql = "postgresql"   # futuro v1.1
-    mysql      = "mysql"        # futuro v1.1
+    mysql      = "mysql"
+    postgresql = "postgresql"
 
 
 class ExecutionMode(str, Enum):
     sql      = "sql"       # query / DML directo con parámetros posicionales
-    block    = "block"     # bloque de código (T-SQL batch, etc.)
+    block    = "block"     # bloque de código (T-SQL batch, DDL, etc.)
     callable = "callable"  # stored procedure o función nombrada
 
 
@@ -66,16 +66,16 @@ class ExecuteRequest(BaseModel):
 # ------------------------------------------------------------------ #
 
 class ExecuteResponse(BaseModel):
-    status:       str            = Field(..., description="'ok' o 'error'")
-    rows_affected: int | None    = Field(None, description="Filas afectadas (DML/DDL)")
-    columns:      list[str]      = Field(default=[], description="Nombres de columnas")
-    data:         list[dict[str, Any]] = Field(default=[], description="Filas como objetos")
-    execution_ms: int            = Field(..., description="Tiempo de ejecución en ms")
-    error_code:   str | None     = Field(None, description="Código de error si status=error")
-    error_message: str | None    = Field(None, description="Mensaje de error si status=error")
+    status:        str                  = Field(..., description="'ok' o 'error'")
+    rows_affected: int | None           = Field(None, description="Filas afectadas (DML/DDL)")
+    columns:       list[str]            = Field(default=[], description="Nombres de columnas")
+    data:          list[dict[str, Any]] = Field(default=[], description="Filas como objetos")
+    execution_ms:  int                  = Field(..., description="Tiempo de ejecución en ms")
+    error_code:    str | None           = Field(None, description="Código de error si status=error")
+    error_message: str | None           = Field(None, description="Mensaje de error si status=error")
 
 
 class HealthResponse(BaseModel):
-    status:  str = "ok"
-    version: str = "1.1.0"
-    drivers: list[str] = ["sqlserver", "mysql"]
+    status:  str       = "ok"
+    version: str       = "1.2.0"
+    drivers: list[str] = ["sqlserver", "mysql", "postgresql"]

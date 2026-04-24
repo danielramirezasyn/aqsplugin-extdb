@@ -3,22 +3,24 @@
 # Base image: python:3.12-slim (Debian Bookworm)
 # Incluye: FastAPI + pyodbc + ODBC Driver 18 for SQL Server
 #                   + mysql-connector-python para MySQL/MariaDB
+#                   + psycopg2-binary para PostgreSQL
 # ============================================================
 
 FROM python:3.12-slim
 
 # --- Metadatos de la imagen ---
 LABEL maintainer="ApiQuickServe <team@apiquickserve.io>"
-LABEL version="1.1.0"
-LABEL description="Stateless plugin para conectividad con bases de datos externas desde ApiQuickServe"
+LABEL version="1.2.0"
+LABEL description="Plugin para conectividad con bases de datos externas desde ApiQuickServe"
 
-# --- Variables de entorno ---
+# --- Variables de entorno base ---
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_PORT=8000
 
 # --- Dependencias del sistema + ODBC Driver 18 for SQL Server ---
-# Microsoft publica los paquetes para Debian en su propio repositorio APT
+# Microsoft publica los paquetes para Debian en su propio repositorio APT.
+# psycopg2-binary incluye libpq estáticamente — no se necesita instalar libpq por separado.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         gnupg2 \

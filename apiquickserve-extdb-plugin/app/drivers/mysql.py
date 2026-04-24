@@ -2,24 +2,28 @@ from __future__ import annotations
 
 import time
 import logging
-from typing import Any
+from typing import Any, Tuple
 
 import mysql.connector
 import mysql.connector.errors as mysql_errors
 
 from app.drivers.base import BaseDriver
 from app.models.schemas import ConnectionParams, ExecutionMode, ExecuteResponse
+from app.core.pool_config import pool_config
+from app.core.pool_manager import PoolManager, make_pool_key
 
 logger = logging.getLogger(__name__)
 
 
-# Códigos de error normalizados (mismos que sqlserver para consistencia)
 class ErrorCode:
     CONNECTION_FAILED = "CONNECTION_FAILED"
     QUERY_FAILED      = "QUERY_FAILED"
     UNSUPPORTED_MODE  = "UNSUPPORTED_MODE"
     TIMEOUT           = "TIMEOUT"
     UNKNOWN           = "UNKNOWN_ERROR"
+
+# errno de MySQL que indican conexión rota (servidor caído, timeout, etc.)
+_BROKEN_ERRNOS = {2003, 2006, 2013, 2055}
 
 
 class MySqlDriver(BaseDriver):
@@ -32,35 +36,70 @@ class MySqlDriver(BaseDriver):
       - callable: CALL stored_procedure con parámetros
 
     Normalización de placeholders:
-      Los statements pueden usar '?' (consistente con el driver de SQL Server).
+      Los statements pueden usar '?' (consistente con el driver SQL Server).
       El driver los convierte internamente a '%s' que requiere mysql-connector-python.
 
-    Abre una conexión por request y la cierra al finalizar.
-    No usa connection pooling en v1.0.
+    Usa connection pooling cuando POOL_ENABLED=true (default).
     """
 
-    CONNECT_TIMEOUT = 10  # segundos
+    CONNECT_TIMEOUT = 10
 
     def __init__(self, connection: ConnectionParams) -> None:
         super().__init__(connection)
 
+    # ---------------------------------------------------------------- #
+    #  Conexión                                                          #
+    # ---------------------------------------------------------------- #
+
     def build_connection_string(self) -> dict:
-        """
-        Retorna un dict de kwargs para mysql.connector.connect().
-        MySQL no usa un DSN de cadena como ODBC; se configura por parámetros.
-        """
         c = self.connection
         return {
-            "host":             c.host,
-            "port":             c.port,
-            "database":         c.database,
-            "user":             c.username,
-            "password":         c.password,
+            "host":               c.host,
+            "port":               c.port,
+            "database":           c.database,
+            "user":               c.username,
+            "password":           c.password,
             "connection_timeout": self.CONNECT_TIMEOUT,
-            "autocommit":       False,
-            "charset":          "utf8mb4",
-            "use_unicode":      True,
+            "autocommit":         False,
+            "charset":            "utf8mb4",
+            "use_unicode":        True,
         }
+
+    def _connect(self):
+        return mysql.connector.connect(**self.build_connection_string())
+
+    def _pool_key(self) -> str:
+        c = self.connection
+        return make_pool_key("mysql", c.host, c.port, c.database, c.username, c.password)
+
+    def _is_alive(self, conn) -> bool:
+        return conn.is_connected()
+
+    def _get_conn(self) -> Tuple[Any, Any, bool]:
+        """Retorna (conn, born, use_pool)."""
+        if pool_config.enabled:
+            pool = PoolManager.get().get_pool(self._pool_key(), self._connect, pool_config)
+            raw, born = pool.acquire()
+            return raw, born, True
+        return self._connect(), None, False
+
+    def _return_conn(self, conn, born, use_pool: bool, broken: bool = False) -> None:
+        if use_pool:
+            pool = PoolManager.get().get_pool(self._pool_key(), self._connect, pool_config)
+            if broken or not self._is_alive(conn):
+                pool.discard(conn)
+            else:
+                pool.release(conn, born)
+        else:
+            try:
+                if conn.is_connected():
+                    conn.close()
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------- #
+    #  execute                                                           #
+    # ---------------------------------------------------------------- #
 
     def execute(
         self,
@@ -69,32 +108,35 @@ class MySqlDriver(BaseDriver):
         params:    list[Any],
     ) -> ExecuteResponse:
 
-        start = time.monotonic()
-        conn  = None
+        start    = time.monotonic()
+        conn     = None
+        born     = None
+        use_pool = False
+        broken   = False
 
         try:
-            conn = mysql.connector.connect(**self.build_connection_string())
-        except mysql_errors.InterfaceError as e:
+            conn, born, use_pool = self._get_conn()
+        except TimeoutError as e:
             ms = self._elapsed_ms(start)
-            logger.error("MySQL connection failed (InterfaceError). errno: %s | ms: %d", e.errno, ms)
+            logger.error("MySQL pool timeout. ms: %d", ms)
+            return ExecuteResponse(
+                status="error",
+                execution_ms=ms,
+                error_code=ErrorCode.TIMEOUT,
+                error_message=f"Timeout esperando conexión del pool. {e}",
+            )
+        except (mysql_errors.InterfaceError, mysql_errors.DatabaseError) as e:
+            ms = self._elapsed_ms(start)
+            logger.error("MySQL connection failed. errno: %s | ms: %d", e.errno, ms)
             return ExecuteResponse(
                 status="error",
                 execution_ms=ms,
                 error_code=ErrorCode.CONNECTION_FAILED,
                 error_message=f"No se pudo conectar al servidor MySQL. errno: {e.errno}",
             )
-        except mysql_errors.DatabaseError as e:
-            ms = self._elapsed_ms(start)
-            logger.error("MySQL connection failed (DatabaseError). errno: %s | ms: %d", e.errno, ms)
-            return ExecuteResponse(
-                status="error",
-                execution_ms=ms,
-                error_code=ErrorCode.CONNECTION_FAILED,
-                error_message=f"Error de base de datos al conectar. errno: {e.errno}",
-            )
 
         try:
-            cursor = conn.cursor(dictionary=True)  # filas como dict directamente
+            cursor = conn.cursor(dictionary=True)
 
             if mode == ExecutionMode.sql:
                 return self._execute_sql(cursor, statement, params, start, conn)
@@ -114,7 +156,11 @@ class MySqlDriver(BaseDriver):
                 )
 
         except mysql_errors.Error as e:
-            conn.rollback()
+            broken = getattr(e, "errno", None) in _BROKEN_ERRNOS
+            try:
+                conn.rollback()
+            except Exception:
+                broken = True
             ms = self._elapsed_ms(start)
             logger.error("MySQL execution failed. errno: %s | ms: %d", e.errno, ms)
             return ExecuteResponse(
@@ -125,8 +171,10 @@ class MySqlDriver(BaseDriver):
             )
 
         except Exception:
-            if conn:
+            try:
                 conn.rollback()
+            except Exception:
+                broken = True
             ms = self._elapsed_ms(start)
             logger.exception("Unexpected error during MySQL execution. ms: %d", ms)
             return ExecuteResponse(
@@ -137,12 +185,12 @@ class MySqlDriver(BaseDriver):
             )
 
         finally:
-            if conn and conn.is_connected():
-                conn.close()
+            if conn:
+                self._return_conn(conn, born, use_pool, broken)
 
-    # ------------------------------------------------------------------ #
-    #  Modos de ejecución                                                   #
-    # ------------------------------------------------------------------ #
+    # ---------------------------------------------------------------- #
+    #  Modos de ejecución                                                #
+    # ---------------------------------------------------------------- #
 
     def _execute_sql(
         self,
@@ -152,17 +200,12 @@ class MySqlDriver(BaseDriver):
         start:     float,
         conn,
     ) -> ExecuteResponse:
-        """
-        Ejecuta un query SQL con parámetros posicionales.
-        Convierte '?' → '%s' para compatibilidad con mysql-connector-python.
-        Detecta automáticamente si retorna filas (SELECT) o no (DML).
-        """
         normalized = self._normalize_placeholders(statement)
         cursor.execute(normalized, params or [])
 
         if cursor.description:
             columns = [col[0] for col in cursor.description]
-            rows    = cursor.fetchall()          # lista de dicts (cursor dictionary=True)
+            rows    = cursor.fetchall()
             conn.commit()
             return ExecuteResponse(
                 status="ok",
@@ -187,10 +230,6 @@ class MySqlDriver(BaseDriver):
         start:     float,
         conn,
     ) -> ExecuteResponse:
-        """
-        Ejecuta una sentencia DDL o script SQL autocontenido sin parámetros.
-        Útil para CREATE TABLE, ALTER, DROP, etc.
-        """
         cursor.execute(statement)
         affected = cursor.rowcount
         conn.commit()
@@ -208,12 +247,6 @@ class MySqlDriver(BaseDriver):
         start:     float,
         conn,
     ) -> ExecuteResponse:
-        """
-        Ejecuta un stored procedure MySQL por nombre.
-        El statement es el nombre del SP; los params son sus argumentos IN.
-        Ejemplo: statement="sp_get_cliente", params=["8-123-456"]
-        Internamente construye: CALL sp_get_cliente(%s)
-        """
         placeholders = ", ".join(["%s"] * len(params)) if params else ""
         call_stmt    = f"CALL {statement}({placeholders})"
 
@@ -239,9 +272,9 @@ class MySqlDriver(BaseDriver):
             execution_ms=self._elapsed_ms(start),
         )
 
-    # ------------------------------------------------------------------ #
-    #  Utilidades internas                                                  #
-    # ------------------------------------------------------------------ #
+    # ---------------------------------------------------------------- #
+    #  Utilidades internas                                               #
+    # ---------------------------------------------------------------- #
 
     @staticmethod
     def _normalize_placeholders(statement: str) -> str:

@@ -23,12 +23,12 @@ services:
   # Plugin: External DB Connector
   # ----------------------------------------------------------
   extdb-plugin:
-    image: apiquickserve/extdb:1.0.0
+    image: apiquickserve/extdb:1.2.0
     container_name: extdb-plugin
     restart: unless-stopped
 
     ports:
-      # Puerto 9000 en el host → 8000 dentro del contenedor
+      # Puerto 9000 en el host → 8000 dentro del contenedor.
       # Solo necesario para pruebas directas o monitoreo externo.
       # ApiQuickServe usa el nombre de servicio interno, no este puerto.
       - "9000:8000"
@@ -37,9 +37,38 @@ services:
       - aqsnet
 
     environment:
-      # API Key obligatoria. Sin esta variable el contenedor no arranca.
-      # Cámbiala por una clave segura antes de desplegar en producción.
+      # -------------------------------------------------------
+      # OBLIGATORIO: API Key de autenticación.
+      # Sin esta variable el contenedor no arranca.
+      # Cámbiala por una clave segura antes de desplegar.
+      # -------------------------------------------------------
       PLUGIN_API_KEY: "cambia_esto_por_tu_clave_secreta"
+
+      # -------------------------------------------------------
+      # Connection Pool — todas las variables son opcionales.
+      # Los valores mostrados son los defaults.
+      # -------------------------------------------------------
+
+      # Activa o desactiva el pool globalmente.
+      # Valores: "true" | "false"
+      POOL_ENABLED: "true"
+
+      # Conexiones que se crean al arrancar el pool (pre-calentamiento).
+      # Cada combinación única (driver+host+db+usuario) tiene su propio pool.
+      POOL_MIN_SIZE: "2"
+
+      # Máximo de conexiones simultáneas por pool.
+      # Aumentar si ves timeouts bajo carga alta.
+      POOL_MAX_SIZE: "10"
+
+      # Segundos que un request espera por una conexión libre antes de fallar
+      # con error TIMEOUT. Aumentar si tus queries son lentos.
+      POOL_TIMEOUT: "30"
+
+      # Segundos de vida máxima de una conexión antes de ser reemplazada.
+      # Evita usar conexiones "zombi" que el servidor ya cerró silenciosamente.
+      # 1800 = 30 minutos.
+      POOL_RECYCLE: "1800"
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -55,7 +84,7 @@ services:
         max-file: "3"
 
 # ----------------------------------------------------------
-# Red interna compartida
+# Red interna compartida.
 # Si ya está declarada en tu compose principal,
 # referenciarla como external: true
 # ----------------------------------------------------------

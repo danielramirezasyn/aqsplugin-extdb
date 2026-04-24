@@ -4,7 +4,9 @@ import time
 import logging
 from typing import Any, Tuple
 
-import pyodbc
+import psycopg2
+import psycopg2.extras
+import psycopg2.errors
 
 from app.drivers.base import BaseDriver
 from app.models.schemas import ConnectionParams, ExecutionMode, ExecuteResponse
@@ -13,29 +15,32 @@ from app.core.pool_manager import PoolManager, make_pool_key
 
 logger = logging.getLogger(__name__)
 
+CONNECT_TIMEOUT = 10  # segundos
+
 
 class ErrorCode:
     CONNECTION_FAILED = "CONNECTION_FAILED"
     QUERY_FAILED      = "QUERY_FAILED"
     UNSUPPORTED_MODE  = "UNSUPPORTED_MODE"
-    DRIVER_NOT_FOUND  = "DRIVER_NOT_FOUND"
     TIMEOUT           = "TIMEOUT"
     UNKNOWN           = "UNKNOWN_ERROR"
 
 
-class SqlServerDriver(BaseDriver):
+class PostgreSqlDriver(BaseDriver):
     """
-    Driver para Microsoft SQL Server usando pyodbc + ODBC Driver 18.
+    Driver para PostgreSQL usando psycopg2.
 
     Soporta los tres modos de ejecución:
-      - sql:      SELECT, INSERT, UPDATE, DELETE con parámetros posicionales (?)
-      - block:    T-SQL batch / bloque de código sin retorno de filas
-      - callable: EXEC stored_procedure con parámetros
+      - sql:      SELECT, INSERT, UPDATE, DELETE con parámetros posicionales (%s)
+      - block:    Sentencias DDL / scripts sin parámetros
+      - callable: CALL stored_procedure(%s, %s)  — requiere PostgreSQL 11+
+
+    Normalización de placeholders:
+      Los statements pueden usar '?' (consistente con el driver SQL Server).
+      El driver los convierte internamente a '%s' que requiere psycopg2.
 
     Usa connection pooling cuando POOL_ENABLED=true (default).
     """
-
-    ODBC_DRIVER = "ODBC Driver 18 for SQL Server"
 
     def __init__(self, connection: ConnectionParams) -> None:
         super().__init__(connection)
@@ -44,25 +49,29 @@ class SqlServerDriver(BaseDriver):
     #  Conexión                                                          #
     # ---------------------------------------------------------------- #
 
-    def build_connection_string(self) -> str:
+    def build_connection_string(self) -> dict:
         c = self.connection
-        return (
-            f"DRIVER={{{self.ODBC_DRIVER}}};"
-            f"SERVER={c.host},{c.port};"
-            f"DATABASE={c.database};"
-            f"UID={c.username};"
-            f"PWD={c.password};"
-            "TrustServerCertificate=yes;"
-            "Encrypt=yes;"
-            "Connection Timeout=10;"
-        )
+        return {
+            "host":             c.host,
+            "port":             c.port,
+            "dbname":           c.database,
+            "user":             c.username,
+            "password":         c.password,
+            "connect_timeout":  CONNECT_TIMEOUT,
+            "options":          "-c statement_timeout=60000",  # 60s máximo por query
+        }
 
     def _connect(self):
-        return pyodbc.connect(self.build_connection_string(), autocommit=False)
+        conn = psycopg2.connect(**self.build_connection_string())
+        conn.autocommit = False
+        return conn
 
     def _pool_key(self) -> str:
         c = self.connection
-        return make_pool_key("sqlserver", c.host, c.port, c.database, c.username, c.password)
+        return make_pool_key("postgresql", c.host, c.port, c.database, c.username, c.password)
+
+    def _is_alive(self, conn) -> bool:
+        return conn.closed == 0
 
     def _get_conn(self) -> Tuple[Any, Any, bool]:
         """Retorna (conn, born, use_pool)."""
@@ -96,35 +105,35 @@ class SqlServerDriver(BaseDriver):
         params:    list[Any],
     ) -> ExecuteResponse:
 
-        start    = time.monotonic()
-        conn     = None
-        born     = None
+        start  = time.monotonic()
+        conn   = None
+        born   = None
         use_pool = False
-        broken   = False
+        broken = False
 
         try:
             conn, born, use_pool = self._get_conn()
         except TimeoutError as e:
             ms = self._elapsed_ms(start)
-            logger.error("SQL Server pool timeout. ms: %d", ms)
+            logger.error("PostgreSQL pool timeout. ms: %d", ms)
             return ExecuteResponse(
                 status="error",
                 execution_ms=ms,
                 error_code=ErrorCode.TIMEOUT,
                 error_message=f"Timeout esperando conexión del pool. {e}",
             )
-        except pyodbc.Error as e:
+        except psycopg2.OperationalError as e:
             ms = self._elapsed_ms(start)
-            logger.error("SQL Server connection failed. SQLSTATE: %s | ms: %d", self._sqlstate(e), ms)
+            logger.error("PostgreSQL connection failed. ms: %d", ms)
             return ExecuteResponse(
                 status="error",
                 execution_ms=ms,
                 error_code=ErrorCode.CONNECTION_FAILED,
-                error_message=f"No se pudo conectar al servidor. SQLSTATE: {self._sqlstate(e)}",
+                error_message=f"No se pudo conectar al servidor PostgreSQL. {self._pg_msg(e)}",
             )
 
         try:
-            cursor = conn.cursor()
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
             if mode == ExecutionMode.sql:
                 return self._execute_sql(cursor, statement, params, start, conn)
@@ -140,24 +149,36 @@ class SqlServerDriver(BaseDriver):
                     status="error",
                     execution_ms=self._elapsed_ms(start),
                     error_code=ErrorCode.UNSUPPORTED_MODE,
-                    error_message=f"Modo '{mode}' no soportado por el driver sqlserver.",
+                    error_message=f"Modo '{mode}' no soportado por el driver postgresql.",
                 )
 
-        except pyodbc.Error as e:
-            sqlstate = self._sqlstate(e)
-            # SQLSTATE 08xxx = errores de comunicación/conexión → conexión rota
-            broken = str(sqlstate).startswith("08")
+        except psycopg2.OperationalError as e:
+            broken = not self._is_alive(conn)
             try:
                 conn.rollback()
             except Exception:
                 broken = True
             ms = self._elapsed_ms(start)
-            logger.error("SQL Server execution failed. SQLSTATE: %s | ms: %d", sqlstate, ms)
+            logger.error("PostgreSQL connection error during execution. ms: %d", ms)
+            return ExecuteResponse(
+                status="error",
+                execution_ms=ms,
+                error_code=ErrorCode.CONNECTION_FAILED,
+                error_message=f"Error de conexión durante la ejecución. {self._pg_msg(e)}",
+            )
+
+        except psycopg2.Error as e:
+            try:
+                conn.rollback()
+            except Exception:
+                broken = True
+            ms = self._elapsed_ms(start)
+            logger.error("PostgreSQL execution failed. pgcode: %s | ms: %d", e.pgcode, ms)
             return ExecuteResponse(
                 status="error",
                 execution_ms=ms,
                 error_code=ErrorCode.QUERY_FAILED,
-                error_message=f"Error al ejecutar la operación. SQLSTATE: {sqlstate}",
+                error_message=f"Error al ejecutar la operación. pgcode: {e.pgcode}",
             )
 
         except Exception:
@@ -166,7 +187,7 @@ class SqlServerDriver(BaseDriver):
             except Exception:
                 broken = True
             ms = self._elapsed_ms(start)
-            logger.exception("Unexpected error during SQL Server execution. ms: %d", ms)
+            logger.exception("Unexpected error during PostgreSQL execution. ms: %d", ms)
             return ExecuteResponse(
                 status="error",
                 execution_ms=ms,
@@ -190,12 +211,13 @@ class SqlServerDriver(BaseDriver):
         start:     float,
         conn,
     ) -> ExecuteResponse:
-        cursor.execute(statement, params or [])
+        normalized = self._normalize_placeholders(statement)
+        cursor.execute(normalized, params or [])
 
         if cursor.description:
-            columns = [col[0] for col in cursor.description]
-            rows    = cursor.fetchall()
-            data    = [dict(zip(columns, row)) for row in rows]
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            data = [dict(row) for row in rows]
             conn.commit()
             return ExecuteResponse(
                 status="ok",
@@ -237,15 +259,21 @@ class SqlServerDriver(BaseDriver):
         start:     float,
         conn,
     ) -> ExecuteResponse:
-        placeholders = ", ".join(["?"] * len(params)) if params else ""
-        exec_stmt    = f"EXEC {statement} {placeholders}".strip()
+        """
+        Ejecuta un stored procedure PostgreSQL (requiere PG 11+).
+        El statement es el nombre del procedure; los params son sus argumentos.
+        Ejemplo: statement="sp_calcular_riesgo", params=["8-123-456"]
+        Internamente construye: CALL sp_calcular_riesgo(%s)
+        """
+        placeholders = ", ".join(["%s"] * len(params)) if params else ""
+        call_stmt    = f"CALL {statement}({placeholders})"
 
-        cursor.execute(exec_stmt, params or [])
+        cursor.execute(call_stmt, params or [])
 
         if cursor.description:
-            columns = [col[0] for col in cursor.description]
             rows    = cursor.fetchall()
-            data    = [dict(zip(columns, row)) for row in rows]
+            columns = [desc[0] for desc in cursor.description]
+            data    = [dict(row) for row in rows]
             conn.commit()
             return ExecuteResponse(
                 status="ok",
@@ -268,12 +296,17 @@ class SqlServerDriver(BaseDriver):
     # ---------------------------------------------------------------- #
 
     @staticmethod
+    def _normalize_placeholders(statement: str) -> str:
+        """Convierte placeholders '?' (estilo ODBC) a '%s' (psycopg2)."""
+        return statement.replace("?", "%s")
+
+    @staticmethod
     def _elapsed_ms(start: float) -> int:
         return int((time.monotonic() - start) * 1000)
 
     @staticmethod
-    def _sqlstate(e: pyodbc.Error) -> str:
+    def _pg_msg(e: Exception) -> str:
         try:
-            return e.args[0] if e.args else "UNKNOWN"
+            return str(e).split("\n")[0].strip()
         except Exception:
-            return "UNKNOWN"
+            return "error desconocido"
